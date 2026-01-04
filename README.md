@@ -21,13 +21,13 @@ Delhi Pollution Dashboard transforms scattered air quality data into actionable 
 
 ## ▸ Key Features
 
-- 🌍 **Real-Time Dashboard** – Live KPIs, 7-day trends, critical alerts, and PM2.5/PM10 levels
-- 📊 **Ward-Level Analytics** – 272 interactive ward cards with searchable AQI data
-- 🔍 **Pollution Source Breakdown** – 60% vehicular, 25% industrial, 15% background attribution
-- 📍 **Geospatial Analysis** – Ward boundary mapping with hotspot identification
-- 🎨 **Beautiful UI** – Dark theme with smooth animations and responsive design
-- ⚡ **Fast Performance** – Optimized rendering for 135+ wards grid
-- 🌐 **Global Accessibility** – Deployed on Render for worldwide access
+- **Real-Time Dashboard** – Live KPIs, 7-day trends, critical alerts, and PM2.5/PM10 levels
+- **Ward-Level Analytics** – 272 interactive ward cards with searchable AQI data
+- **Pollution Source Breakdown** – 60% vehicular, 25% industrial, 15% background attribution
+- **Geospatial Analysis** – Ward boundary mapping with hotspot identification
+- **Beautiful UI** – Dark theme with smooth animations and responsive design
+- **Fast Performance** – Optimized rendering for 135+ wards grid
+- **Global Accessibility** – Deployed on Render for worldwide access
 
 ## ▸ Tech Stack
 
@@ -104,16 +104,9 @@ python -m uvicorn Backend.main:app --host 0.0.0.0 --port 8000
 
 **Live Deployment:** https://delhi-pollution.onrender.com
 
-### Deploy to Render
-1. Push code to GitHub (`main` branch)
-2. Go to Render.com → New Web Service
-3. **Build Command:** `npm install && pip install -r Backend/requirements.txt && npm run build`
-4. **Start Command:** `python -m uvicorn Backend.main:app --host 0.0.0.0 --port $PORT`
-5. Deploy! Render auto-rebuilds on every push
-
 ## ▸ Project Demo Video
 
-**Watch the Full Walkthrough:** [YouTube Link - Coming Soon]
+**Watch the Full Walkthrough:** https://youtu.be/QS2J_HTg_Lc
 
 ## ▸ Usage
 
@@ -206,19 +199,6 @@ Delhi-Pollution/
 - ✅ End-to-end data pipeline (collection → processing → visualization)
 - ✅ API-driven architecture for scalability
 
-## ▸ Future Enhancements
-- 📱 Mobile app with push notifications
-- 📈 Historical trend analysis and forecasting
-- 🗺️ Interactive map visualization
-- 📊 Export data as CSV/PDF reports
-- 🔔 User alerts for hazardous AQI levels
-- 🌍 Multi-city expansion (Mumbai, Bangalore, etc.)
-
-## ▸ Known Issues & Limitations
-- Free tier on Render spins down after 15 min inactivity (30-40 sec cold start)
-- Data updates depend on API availability
-- Ward boundaries based on 2020 census data
-
 ## ▸ Contributing
 We welcome contributions! Please:
 1. Fork the repository
@@ -232,15 +212,6 @@ We welcome contributions! Please:
 - **Technologies:** React, FastAPI, GeoPandas, Render
 - **Inspiration:** Global air quality initiatives and public health advocates
 - **Community:** All contributors and users supporting better air quality data
-
-## ▸ License
-MIT License - See LICENSE file for details
-
-## ▸ Contact & Support
-- **GitHub:** https://github.com/Ayaansh08/Delhi-Pollution
-- **Live Site:** https://delhi-pollution.onrender.com
-- **Issues:** GitHub Issues page
-- **Email:** ayaansh@example.com
 
 <div align="center">
   <strong>Delhi Pollution Dashboard</strong><br>
