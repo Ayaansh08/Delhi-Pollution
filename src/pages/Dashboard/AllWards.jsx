@@ -19,7 +19,8 @@ const AllWards = () => {
 
   const fetchWardsData = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/wards');
+      const apiBase = process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '';
+      const response = await fetch(`${apiBase}/api/wards`);
       const data = await response.json();
       setWardsData(data);
     } catch (error) {

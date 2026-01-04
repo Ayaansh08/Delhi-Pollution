@@ -16,7 +16,8 @@ const Dashboard = () => {
   const fetchDashboardData = async () => {
     try {
       setLoading(true);
-      const response = await fetch('http://localhost:8000/api/dashboard');
+      const apiBase = process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '';
+      const response = await fetch(`${apiBase}/api/dashboard`);
       
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
