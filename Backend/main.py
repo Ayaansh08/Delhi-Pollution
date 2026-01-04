@@ -146,6 +146,32 @@ async def get_all_wards():
         'wards': ward_data_clean.to_dict('records'),
         'count': len(ward_data_clean)
     }
+
+# Serve React static files
+import os.path
+from fastapi.responses import FileResponse
+
+dist_dir = os.path.join(os.path.dirname(__file__), '..', 'dist')
+
+# Mount static files if dist folder exists
+if os.path.exists(dist_dir):
+    app.mount("/assets", StaticFiles(directory=os.path.join(dist_dir, "assets")), name="assets")
+    
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        # Serve index.html for all non-API routes (client-side routing)
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        
+        file_path = os.path.join(dist_dir, full_path)
+        
+        # If it's a file that exists, serve it
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        
+        # Otherwise serve index.html for client-side routing
+        return FileResponse(os.path.join(dist_dir, "index.html"))
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
