@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: delhi-pollution-dashboard
+    env: python
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: python -m uvicorn Backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13
