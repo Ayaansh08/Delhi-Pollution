@@ -1,179 +1,1597 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+from pathlib import Path
+import json
+import re
+import math
+import xml.etree.ElementTree as ET
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import os
 
+try:
+    from .policy_model import generate_policy_recommendations
+except ImportError:
+    from policy_model import generate_policy_recommendations
+
+try:
+    from .consumer_model import (
+        PRICING_PAYLOAD,
+        build_personalized_consumer_insight,
+    )
+except ImportError:
+    from consumer_model import (
+        PRICING_PAYLOAD,
+        build_personalized_consumer_insight,
+    )
+
+# --------------------------------------------------
+# PATH SETUP (ROBUST FOR LOCAL + RENDER)
+# --------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DIST_DIR = BASE_DIR / "dist"
+
+WARD_DATA = pd.read_csv(DATA_DIR / "ward_level_aqi_complete.csv")
+AQI_TIMESERIES = pd.read_csv(DATA_DIR / "aqi.csv")
+AQI_TIMESERIES["datetime_ist"] = pd.to_datetime(
+    AQI_TIMESERIES["date_ist"].astype(str) + " " + AQI_TIMESERIES["time_ist"].astype(str),
+    dayfirst=True,
+    errors="coerce",
+)
+AQI_TIMESERIES["date_parsed"] = pd.to_datetime(
+    AQI_TIMESERIES["date_ist"],
+    format="%d/%m/%Y",
+    errors="coerce",
+)
+WARD_GEOJSON = {}
+WARD_GEOJSON_PATH = DATA_DIR / "delhi_wards.geojson"
+if WARD_GEOJSON_PATH.exists():
+    WARD_GEOJSON = json.loads(
+        WARD_GEOJSON_PATH.read_text(encoding="utf-8", errors="replace")
+    )
+
+WARD_KML_FEATURES = []
+WARD_KML_PATH = DATA_DIR / "delhi_wards.kml"
+
+# --------------------------------------------------
+# FASTAPI APP
+# --------------------------------------------------
+
 app = FastAPI()
 
-# CORS setup for React
+# --------------------------------------------------
+# CORS CONFIG
+# --------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "https://*.onrender.com",
-        "*"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],  # safe if not using cookies/auth
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load your ward data
-WARD_DATA = pd.read_csv('Backend/data/ward_level_aqi_complete.csv')
-AQI_TIMESERIES = pd.read_csv('Backend/data/aqi.csv')
+
+class ConsumerProfileInput(BaseModel):
+    ward: str = ""
+    family_members: int = Field(default=1, ge=1, le=20)
+    elderly: bool = False
+    children: bool = False
+    respiratory_issues: bool = False
+    daily_travel_minutes: int = Field(default=60, ge=0, le=600)
+    premium: bool = False
+
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
 
 def get_aqi_status(aqi):
-    """Convert AQI to status category"""
-    if aqi <= 50: return 'good'
-    elif aqi <= 100: return 'moderate'
-    elif aqi <= 200: return 'unhealthy'
-    elif aqi <= 300: return 'very_unhealthy'
-    else: return 'hazardous'
+    if aqi <= 50:
+        return "good"
+    elif aqi <= 100:
+        return "moderate"
+    elif aqi <= 200:
+        return "unhealthy"
+    elif aqi <= 300:
+        return "very_unhealthy"
+    else:
+        return "hazardous"
 
 def get_alert_severity(aqi):
-    """Determine alert severity"""
-    if aqi >= 300: return 'critical'
-    elif aqi >= 200: return 'warning'
-    else: return 'emerging'
+    if aqi >= 300:
+        return "critical"
+    elif aqi >= 200:
+        return "warning"
+    else:
+        return "emerging"
+
+def get_aqi_band_label(aqi):
+    value = safe_to_float(aqi, 0.0)
+    if value > 300:
+        return "Hazardous"
+    if value > 200:
+        return "Very Unhealthy"
+    if value > 100:
+        return "Unhealthy"
+    if value > 50:
+        return "Moderate"
+    return "Good"
+
+def get_dominant_source_label(vehicular_pct, industrial_pct):
+    vehicular = safe_to_float(vehicular_pct, 0.0)
+    industrial = safe_to_float(industrial_pct, 0.0)
+    if abs(vehicular - industrial) < 8:
+        return "Mixed"
+    return "Traffic" if vehicular >= industrial else "Industrial"
+
+def normalize_ward_name(value):
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    text = text.replace("&", "and")
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"[^a-z0-9]+", "", text)
+    return text
+
+def normalize_contributions(vehicular_raw, industrial_raw):
+    vehicular = max(0.0, float(vehicular_raw or 0.0))
+    industrial = max(0.0, float(industrial_raw or 0.0))
+    total = vehicular + industrial
+
+    if total <= 0:
+        return (0, 0, 100)
+
+    if total > 100:
+        scale = 100.0 / total
+        vehicular = vehicular * scale
+        industrial = industrial * scale
+
+    vehicular_int = int(round(vehicular))
+    industrial_int = int(round(industrial))
+    other_int = max(0, 100 - vehicular_int - industrial_int)
+    return (vehicular_int, industrial_int, other_int)
+
+def get_station_snapshot(hours=24):
+    recent = AQI_TIMESERIES.dropna(subset=["datetime_ist"]).copy()
+    if recent.empty:
+        return pd.DataFrame(columns=[
+            "location", "lat", "lon", "aqi_index", "pm2_5", "pm10", "co", "no2"
+        ])
+
+    latest_ts = recent["datetime_ist"].max()
+    window_start = latest_ts - timedelta(hours=hours)
+    window = recent[recent["datetime_ist"] >= window_start]
+    if window.empty:
+        window = recent
+
+    aggregated = (
+        window.groupby("location", dropna=True)[
+            ["lat", "lon", "aqi_index", "pm2_5", "pm10", "co", "no2"]
+        ]
+        .mean()
+        .reset_index()
+    )
+    return aggregated
+
+def build_ward_dataset():
+    ward_data_clean = WARD_DATA.copy()
+    if "name" in ward_data_clean.columns:
+        ward_data_clean = ward_data_clean[ward_data_clean["name"].notna()].copy()
+    if ward_data_clean.empty:
+        return ward_data_clean
+
+    if "location" not in ward_data_clean.columns:
+        ward_data_clean["location"] = ""
+    if "traffic_raw" not in ward_data_clean.columns:
+        ward_data_clean["traffic_raw"] = 0
+    if "industrial_count" not in ward_data_clean.columns:
+        ward_data_clean["industrial_count"] = 0
+    if "distance_km" not in ward_data_clean.columns:
+        ward_data_clean["distance_km"] = 0
+
+    station_snapshot = get_station_snapshot(hours=24)
+    if station_snapshot.empty:
+        return ward_data_clean
+
+    station_lookup = {}
+    for _, row in station_snapshot.iterrows():
+        station_lookup[normalize_ward_name(row["location"])] = row.to_dict()
+
+    fallback_station = {
+        "aqi_index": float(station_snapshot["aqi_index"].mean()),
+        "pm2_5": float(station_snapshot["pm2_5"].mean()),
+        "pm10": float(station_snapshot["pm10"].mean()),
+        "co": float(station_snapshot["co"].mean()),
+        "no2": float(station_snapshot["no2"].mean()),
+    }
+
+    traffic_series = pd.to_numeric(ward_data_clean["traffic_raw"], errors="coerce").fillna(0)
+    industrial_series = pd.to_numeric(ward_data_clean["industrial_count"], errors="coerce").fillna(0)
+    distance_series = pd.to_numeric(ward_data_clean["distance_km"], errors="coerce").fillna(0)
+
+    max_traffic = max(1.0, float(traffic_series.max()))
+    max_industrial = max(1.0, float(industrial_series.max()))
+    max_distance = max(1.0, float(distance_series.max()))
+
+    enriched_rows = []
+    for _, ward in ward_data_clean.iterrows():
+        station = station_lookup.get(
+            normalize_ward_name(ward.get("location")),
+            fallback_station,
+        )
+
+        traffic_norm = safe_to_float(ward.get("traffic_raw"), 0.0) / max_traffic
+        industrial_norm = safe_to_float(ward.get("industrial_count"), 0.0) / max_industrial
+        distance_norm = safe_to_float(ward.get("distance_km"), 0.0) / max_distance
+
+        pressure_score = 0.5 * traffic_norm + 0.35 * industrial_norm + 0.15 * distance_norm
+        aqi_factor = 0.82 + (0.58 * pressure_score)
+        pm25_factor = 0.78 + (0.54 * traffic_norm) + (0.08 * industrial_norm)
+        pm10_factor = 0.72 + (0.5 * industrial_norm) + (0.15 * traffic_norm)
+        gas_factor = 0.84 + (0.42 * pressure_score)
+        no2_factor = 0.8 + (0.5 * traffic_norm)
+
+        updated = ward.to_dict()
+        updated["avg_AQI"] = round(
+            safe_to_float(station.get("aqi_index"), 0.0) * aqi_factor,
+            2,
+        )
+        updated["pm2_5"] = round(safe_to_float(station.get("pm2_5"), 0.0) * pm25_factor, 2)
+        updated["pm10"] = round(safe_to_float(station.get("pm10"), 0.0) * pm10_factor, 2)
+        updated["co"] = round(safe_to_float(station.get("co"), 0.0) * gas_factor, 2)
+        updated["no2"] = round(safe_to_float(station.get("no2"), 0.0) * no2_factor, 2)
+
+        vehicular_raw = (65.0 * traffic_norm) + (20.0 * distance_norm)
+        industrial_raw = 75.0 * industrial_norm
+        vehicular_pct, industrial_pct, _ = normalize_contributions(vehicular_raw, industrial_raw)
+        updated["vehicular_pct"] = vehicular_pct
+        updated["industrial_pct"] = industrial_pct
+
+        enriched_rows.append(updated)
+
+    return pd.DataFrame(enriched_rows)
+
+def add_hourly_weather_features(frame):
+    if frame.empty:
+        return frame
+
+    enriched = frame.sort_values("datetime_ist").copy()
+    enriched["hour"] = enriched["datetime_ist"].dt.hour
+    enriched["day_of_week"] = enriched["datetime_ist"].dt.dayofweek
+    enriched["hour_sin"] = np.sin((2 * np.pi * enriched["hour"]) / 24.0)
+    enriched["hour_cos"] = np.cos((2 * np.pi * enriched["hour"]) / 24.0)
+    enriched["dow_sin"] = np.sin((2 * np.pi * enriched["day_of_week"]) / 7.0)
+    enriched["dow_cos"] = np.cos((2 * np.pi * enriched["day_of_week"]) / 7.0)
+
+    rolling_temp = enriched["temp_c"].rolling(window=6, min_periods=1).mean()
+    enriched["temp_inversion_proxy"] = (rolling_temp - enriched["temp_c"]).clip(lower=0)
+    enriched["stagnation_proxy"] = (
+        enriched["humidity"].clip(lower=0, upper=100) / 100.0
+    ) * (1.0 / (1.0 + enriched["windspeed_kph"].clip(lower=0)))
+    return enriched
+
+def get_city_hourly_snapshot():
+    numeric_columns = [
+        "aqi_index",
+        "temp_c",
+        "humidity",
+        "pressure_mb",
+        "windspeed_kph",
+        "pm2_5",
+        "pm10",
+        "co",
+        "no2",
+    ]
+    recent = AQI_TIMESERIES.dropna(subset=["datetime_ist"]).copy()
+    if recent.empty:
+        return pd.DataFrame(columns=["datetime_ist"] + numeric_columns)
+
+    for column in numeric_columns:
+        recent[column] = pd.to_numeric(recent[column], errors="coerce")
+
+    city = (
+        recent.groupby("datetime_ist", dropna=True)[numeric_columns]
+        .mean()
+        .reset_index()
+        .sort_values("datetime_ist")
+        .reset_index(drop=True)
+    )
+    if city.empty:
+        return city
+
+    return add_hourly_weather_features(city)
+
+def get_station_hourly_snapshot():
+    numeric_columns = [
+        "aqi_index",
+        "temp_c",
+        "humidity",
+        "pressure_mb",
+        "windspeed_kph",
+        "pm2_5",
+        "pm10",
+        "co",
+        "no2",
+    ]
+    recent = AQI_TIMESERIES.dropna(subset=["datetime_ist", "location"]).copy()
+    if recent.empty:
+        return pd.DataFrame(columns=["location", "datetime_ist"] + numeric_columns)
+
+    for column in numeric_columns:
+        recent[column] = pd.to_numeric(recent[column], errors="coerce")
+
+    station_hourly = (
+        recent.groupby(["location", "datetime_ist"], dropna=True)[numeric_columns]
+        .mean()
+        .reset_index()
+        .sort_values(["location", "datetime_ist"])
+        .reset_index(drop=True)
+    )
+    if station_hourly.empty:
+        return station_hourly
+
+    enriched_groups = []
+    for location, group in station_hourly.groupby("location", dropna=True):
+        enriched = add_hourly_weather_features(group)
+        enriched["location"] = location
+        enriched_groups.append(enriched)
+
+    if not enriched_groups:
+        return pd.DataFrame(columns=station_hourly.columns)
+    return pd.concat(enriched_groups, ignore_index=True)
+
+def get_corr_strength(abs_value):
+    if abs_value >= 0.6:
+        return "very_strong"
+    if abs_value >= 0.4:
+        return "strong"
+    if abs_value >= 0.25:
+        return "moderate"
+    if abs_value >= 0.12:
+        return "weak"
+    return "very_weak"
+
+def get_direction_note(metric_id, corr):
+    if metric_id == "wind_speed":
+        if corr < -0.05:
+            return "Higher wind speed is linked with lower AQI from better dispersion."
+        if corr > 0.05:
+            return "Higher wind speed is linked with higher AQI in this dataset window."
+        return "Wind speed has limited direct effect in this sample window."
+    if metric_id == "humidity":
+        if corr > 0.05:
+            return "Higher humidity aligns with higher AQI, likely trapping particles."
+        if corr < -0.05:
+            return "Higher humidity aligns with lower AQI in this sample window."
+        return "Humidity effect is weak in this sample window."
+
+    if corr > 0.05:
+        return "Higher inversion proxy aligns with higher AQI accumulation."
+    if corr < -0.05:
+        return "Higher inversion proxy aligns with lower AQI in this sample window."
+    return "Inversion proxy effect is weak in this sample window."
+
+def build_weather_correlation_payload(city_hourly):
+    payload = {
+        "sampleHours": 0,
+        "periodStart": None,
+        "periodEnd": None,
+        "factors": [],
+        "topDriver": None,
+    }
+    if city_hourly.empty or len(city_hourly) < 48:
+        return payload
+
+    usable = city_hourly.dropna(
+        subset=[
+            "aqi_index",
+            "windspeed_kph",
+            "humidity",
+            "temp_inversion_proxy",
+        ]
+    ).copy()
+    if usable.empty:
+        return payload
+
+    factor_config = [
+        ("wind_speed", "Wind Speed", "windspeed_kph"),
+        ("humidity", "Humidity", "humidity"),
+        ("temp_inversion", "Temp Inversion Proxy", "temp_inversion_proxy"),
+    ]
+
+    factors = []
+    for factor_id, label, column in factor_config:
+        corr = usable["aqi_index"].corr(usable[column])
+        corr = 0.0 if pd.isna(corr) else float(corr)
+        factors.append({
+            "id": factor_id,
+            "label": label,
+            "correlation": round(corr, 3),
+            "absCorrelation": round(abs(corr), 3),
+            "strength": get_corr_strength(abs(corr)),
+            "insight": get_direction_note(factor_id, corr),
+        })
+
+    total_abs = sum(item["absCorrelation"] for item in factors)
+    for item in factors:
+        if total_abs <= 0:
+            item["impactScore"] = 0
+        else:
+            item["impactScore"] = int(round((item["absCorrelation"] / total_abs) * 100))
+
+    top_driver = max(factors, key=lambda item: item["absCorrelation"])
+    return {
+        "sampleHours": int(len(usable)),
+        "periodStart": usable["datetime_ist"].min().isoformat(),
+        "periodEnd": usable["datetime_ist"].max().isoformat(),
+        "factors": factors,
+        "topDriver": top_driver["label"],
+    }
+
+def fit_ridge_regression(X, y, l2_penalty=1.0):
+    X_values = np.asarray(X, dtype=float)
+    y_values = np.asarray(y, dtype=float)
+
+    X_design = np.column_stack([np.ones(X_values.shape[0]), X_values])
+    reg = np.eye(X_design.shape[1], dtype=float) * float(l2_penalty)
+    reg[0, 0] = 0.0
+
+    lhs = X_design.T @ X_design + reg
+    rhs = X_design.T @ y_values
+    try:
+        beta = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        beta = np.linalg.pinv(lhs) @ rhs
+    return beta
+
+def ridge_predict(X, beta):
+    X_values = np.asarray(X, dtype=float)
+    if X_values.ndim == 1:
+        X_values = X_values.reshape(1, -1)
+    X_design = np.column_stack([np.ones(X_values.shape[0]), X_values])
+    return X_design @ beta
+
+def get_model_quality(mae):
+    if mae <= 14:
+        return "high"
+    if mae <= 24:
+        return "medium"
+    return "low"
+
+def build_aqi_forecast_payload(city_hourly):
+    default_payload = {
+        "generatedAt": datetime.now().isoformat(),
+        "latestObservedAt": None,
+        "model": {
+            "type": "ridge_linear_regression",
+            "quality": "unavailable",
+            "meanMae": None,
+        },
+        "points": [],
+        "trendDirection": "stable",
+    }
+    if city_hourly.empty or len(city_hourly) < 240:
+        return default_payload
+
+    model_df = city_hourly.copy()
+    for lag in [1, 3, 6, 12, 24]:
+        model_df[f"aqi_lag_{lag}"] = model_df["aqi_index"].shift(lag)
+
+    feature_columns = [
+        "aqi_index",
+        "aqi_lag_1",
+        "aqi_lag_3",
+        "aqi_lag_6",
+        "aqi_lag_12",
+        "aqi_lag_24",
+        "temp_c",
+        "humidity",
+        "windspeed_kph",
+        "pressure_mb",
+        "temp_inversion_proxy",
+        "stagnation_proxy",
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos",
+    ]
+
+    latest_features_df = model_df.dropna(subset=feature_columns)
+    if latest_features_df.empty:
+        return default_payload
+    latest_row = latest_features_df.iloc[-1]
+    latest_features = latest_row[feature_columns].astype(float).values
+    latest_observed_at = latest_row["datetime_ist"]
+
+    forecast_points = []
+    mae_values = []
+    for horizon in [24, 48, 72]:
+        horizon_df = model_df.copy()
+        horizon_df["target"] = horizon_df["aqi_index"].shift(-horizon)
+        horizon_df = horizon_df.dropna(subset=feature_columns + ["target"]).reset_index(drop=True)
+
+        if len(horizon_df) < 300:
+            continue
+
+        split_idx = int(len(horizon_df) * 0.85)
+        split_idx = min(max(split_idx, 120), len(horizon_df) - 1)
+
+        train_df = horizon_df.iloc[:split_idx]
+        test_df = horizon_df.iloc[split_idx:]
+
+        beta = fit_ridge_regression(
+            train_df[feature_columns].values,
+            train_df["target"].values,
+            l2_penalty=2.0,
+        )
+
+        test_pred = ridge_predict(test_df[feature_columns].values, beta)
+        mae = float(np.mean(np.abs(test_df["target"].values - test_pred)))
+        rmse = float(np.sqrt(np.mean((test_df["target"].values - test_pred) ** 2)))
+        mae_values.append(mae)
+
+        predicted = float(ridge_predict(latest_features, beta)[0])
+        predicted = float(np.clip(predicted, 0, 500))
+
+        interval = max(8.0, 1.15 * rmse)
+        lower = float(np.clip(predicted - interval, 0, 500))
+        upper = float(np.clip(predicted + interval, 0, 500))
+
+        forecast_dt = latest_observed_at + timedelta(hours=horizon)
+        forecast_points.append({
+            "horizonHours": int(horizon),
+            "forecastAt": forecast_dt.isoformat(),
+            "predictedAqi": int(round(predicted)),
+            "lowerAqi": int(round(lower)),
+            "upperAqi": int(round(upper)),
+            "status": get_aqi_status(predicted),
+            "mae": round(mae, 2),
+        })
+
+    if not forecast_points:
+        return default_payload
+
+    predicted_values = [point["predictedAqi"] for point in forecast_points]
+    if predicted_values[-1] - predicted_values[0] > 8:
+        trend_direction = "rising"
+    elif predicted_values[0] - predicted_values[-1] > 8:
+        trend_direction = "falling"
+    else:
+        trend_direction = "stable"
+
+    mean_mae = float(np.mean(mae_values)) if mae_values else None
+    return {
+        "generatedAt": datetime.now().isoformat(),
+        "latestObservedAt": latest_observed_at.isoformat(),
+        "model": {
+            "type": "ridge_linear_regression",
+            "quality": get_model_quality(mean_mae or 999),
+            "meanMae": round(mean_mae, 2) if mean_mae is not None else None,
+        },
+        "points": forecast_points,
+        "trendDirection": trend_direction,
+    }
+
+def get_top_factor(factors):
+    if not factors:
+        return None
+    return max(factors, key=lambda item: float(item.get("absCorrelation", 0.0)))
+
+def build_station_weather_correlation_payloads():
+    station_hourly = get_station_hourly_snapshot()
+    if station_hourly.empty:
+        return []
+
+    payloads = []
+    for location, group in station_hourly.groupby("location", dropna=True):
+        payload = build_weather_correlation_payload(group)
+        if payload["sampleHours"] <= 0:
+            continue
+        latest_values = group["aqi_index"].dropna()
+        latest_aqi = float(latest_values.iloc[-1]) if not latest_values.empty else 0.0
+        top_factor = get_top_factor(payload.get("factors", []))
+        payloads.append({
+            "location": location,
+            "currentAqi": int(round(latest_aqi)),
+            "sampleHours": payload.get("sampleHours", 0),
+            "periodStart": payload.get("periodStart"),
+            "periodEnd": payload.get("periodEnd"),
+            "topDriver": top_factor.get("label") if top_factor else None,
+            "topCorrelation": top_factor.get("correlation") if top_factor else 0.0,
+            "factors": payload.get("factors", []),
+        })
+
+    payloads.sort(key=lambda item: item["currentAqi"], reverse=True)
+    return payloads
+
+def build_station_forecast_payloads():
+    station_hourly = get_station_hourly_snapshot()
+    if station_hourly.empty:
+        return []
+
+    payloads = []
+    for location, group in station_hourly.groupby("location", dropna=True):
+        forecast = build_aqi_forecast_payload(group)
+        latest_values = group["aqi_index"].dropna()
+        latest_aqi = float(latest_values.iloc[-1]) if not latest_values.empty else 0.0
+        payloads.append({
+            "location": location,
+            "currentAqi": int(round(latest_aqi)),
+            "forecast": forecast,
+        })
+
+    payloads.sort(key=lambda item: item["currentAqi"], reverse=True)
+    return payloads
+
+def get_forecast_point(points, horizon_hours):
+    for point in points:
+        if int(point.get("horizonHours", -1)) == int(horizon_hours):
+            return point
+    return None
+
+def build_ward_weather_insights(ward_data_clean, station_correlations):
+    station_lookup = {
+        normalize_ward_name(item.get("location")): item for item in station_correlations
+    }
+
+    insights = []
+    for _, row in ward_data_clean.sort_values("avg_AQI", ascending=False).iterrows():
+        location = row.get("location")
+        station = station_lookup.get(normalize_ward_name(location))
+        top_factor = get_top_factor(station.get("factors", [])) if station else None
+
+        correlation = float(top_factor.get("correlation", 0.0)) if top_factor else 0.0
+        strength = top_factor.get("strength", "unknown") if top_factor else "unknown"
+        top_driver = top_factor.get("label", "Insufficient data") if top_factor else "Insufficient data"
+        impact_index = int(round(abs(correlation) * max(0.0, safe_to_float(row.get("avg_AQI"), 0.0))))
+
+        insights.append({
+            "ward": row.get("name"),
+            "location": location,
+            "aqi": int(round(safe_to_float(row.get("avg_AQI"), 0.0))),
+            "status": get_aqi_status(safe_to_float(row.get("avg_AQI"), 0.0)),
+            "topDriver": top_driver,
+            "correlation": round(correlation, 3),
+            "strength": strength,
+            "impactIndex": impact_index,
+            "dataQuality": "observed_station" if station else "fallback_city",
+        })
+
+    insights.sort(key=lambda item: item["impactIndex"], reverse=True)
+    return insights
+
+def build_ward_forecast_insights(ward_data_clean, station_forecasts, city_forecast):
+    station_lookup = {
+        normalize_ward_name(item.get("location")): item for item in station_forecasts
+    }
+    station_snapshot = get_station_snapshot(hours=24)
+    station_current_lookup = {}
+    for _, row in station_snapshot.iterrows():
+        station_current_lookup[normalize_ward_name(row.get("location"))] = safe_to_float(
+            row.get("aqi_index"),
+            0.0,
+        )
+
+    city_points = city_forecast.get("points", [])
+    city_mean = safe_to_float(ward_data_clean["avg_AQI"].mean(), 0.0)
+    fallback_base = city_mean if city_mean > 0 else 1.0
+
+    insights = []
+    for _, row in ward_data_clean.sort_values("avg_AQI", ascending=False).iterrows():
+        location = row.get("location")
+        location_key = normalize_ward_name(location)
+        station_entry = station_lookup.get(location_key)
+        station_forecast = station_entry.get("forecast") if station_entry else None
+
+        source_points = (
+            station_forecast.get("points", [])
+            if station_forecast and station_forecast.get("points")
+            else city_points
+        )
+        if not source_points:
+            continue
+
+        station_base = station_current_lookup.get(location_key, fallback_base)
+        ward_current = safe_to_float(row.get("avg_AQI"), 0.0)
+        if station_base <= 0:
+            station_base = fallback_base
+
+        scale = ward_current / max(1.0, station_base)
+        scale = float(np.clip(scale, 0.45, 2.25))
+
+        ward_points = []
+        for point in source_points:
+            predicted = int(round(np.clip(point.get("predictedAqi", 0) * scale, 0, 500)))
+            lower = int(round(np.clip(point.get("lowerAqi", 0) * scale, 0, 500)))
+            upper = int(round(np.clip(point.get("upperAqi", 0) * scale, 0, 500)))
+
+            ward_points.append({
+                "horizonHours": int(point.get("horizonHours", 0)),
+                "forecastAt": point.get("forecastAt"),
+                "predictedAqi": predicted,
+                "lowerAqi": lower,
+                "upperAqi": upper,
+                "status": get_aqi_status(predicted),
+            })
+
+        ward_points.sort(key=lambda item: item["horizonHours"])
+        first = ward_points[0]["predictedAqi"]
+        last = ward_points[-1]["predictedAqi"]
+        if last - first > 8:
+            trend_direction = "rising"
+        elif first - last > 8:
+            trend_direction = "falling"
+        else:
+            trend_direction = "stable"
+
+        point_24 = get_forecast_point(ward_points, 24)
+        point_72 = get_forecast_point(ward_points, 72) or ward_points[-1]
+        delta_24 = int(point_24["predictedAqi"] - round(ward_current)) if point_24 else 0
+        delta_72 = int(point_72["predictedAqi"] - round(ward_current)) if point_72 else 0
+
+        model = station_forecast.get("model", {}) if station_forecast else city_forecast.get("model", {})
+        insights.append({
+            "ward": row.get("name"),
+            "location": location,
+            "currentAqi": int(round(ward_current)),
+            "trendDirection": trend_direction,
+            "delta24": delta_24,
+            "delta72": delta_72,
+            "modelQuality": model.get("quality", "unavailable"),
+            "points": ward_points,
+            "dataQuality": "station_scaled" if station_entry else "city_scaled",
+        })
+
+    insights.sort(key=lambda item: item["currentAqi"], reverse=True)
+    return insights
+
+KML_NS = {"k": "http://www.opengis.net/kml/2.2"}
+
+def safe_to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if default is None:
+            return None
+        return float(default)
+
+def safe_to_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        if default is None:
+            return None
+        return int(default)
+
+def parse_kml_coordinates(text):
+    points = []
+    if not text:
+        return points
+    for token in str(text).replace("\n", " ").replace("\t", " ").split():
+        parts = token.split(",")
+        if len(parts) < 2:
+            continue
+        lon = safe_to_float(parts[0], None)
+        lat = safe_to_float(parts[1], None)
+        if lon is None or lat is None:
+            continue
+        points.append([lon, lat])
+    if points and points[0] != points[-1]:
+        points.append(points[0])
+    return points
+
+def parse_kml_polygon_node(polygon_node):
+    outer_nodes = polygon_node.findall(
+        "k:outerBoundaryIs/k:LinearRing/k:coordinates", KML_NS
+    )
+    if not outer_nodes:
+        return None
+
+    outer_ring = parse_kml_coordinates(outer_nodes[0].text)
+    if len(outer_ring) < 4:
+        return None
+
+    rings = [outer_ring]
+    inner_nodes = polygon_node.findall(
+        "k:innerBoundaryIs/k:LinearRing/k:coordinates", KML_NS
+    )
+    for inner in inner_nodes:
+        hole = parse_kml_coordinates(inner.text)
+        if len(hole) >= 4:
+            rings.append(hole)
+    return rings
+
+def parse_kml_features(path):
+    root = ET.parse(path).getroot()
+    features = []
+
+    for placemark in root.findall(".//k:Placemark", KML_NS):
+        simple_props = {}
+        for node in placemark.findall(".//k:SimpleData", KML_NS):
+            key = node.get("name")
+            if key:
+                simple_props[key] = (node.text or "").strip()
+
+        ward_name = (
+            simple_props.get("WardName")
+            or simple_props.get("NW2022")
+            or (placemark.findtext("k:name", default="", namespaces=KML_NS) or "").strip()
+        )
+        if not ward_name:
+            continue
+
+        polygons = []
+        for polygon_node in placemark.findall(".//k:Polygon", KML_NS):
+            parsed = parse_kml_polygon_node(polygon_node)
+            if parsed:
+                polygons.append(parsed)
+
+        if not polygons:
+            continue
+
+        geometry = (
+            {"type": "Polygon", "coordinates": polygons[0]}
+            if len(polygons) == 1
+            else {"type": "MultiPolygon", "coordinates": polygons}
+        )
+
+        features.append({
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": {
+                "name": ward_name,
+                "ward_no": safe_to_int(simple_props.get("Ward_No"), None),
+                "ac_name": simple_props.get("AC_Name"),
+                "nw2022": simple_props.get("NW2022"),
+            },
+        })
+
+    return features
+
+def load_kml_features():
+    global WARD_KML_FEATURES
+    if WARD_KML_FEATURES:
+        return WARD_KML_FEATURES
+    if not WARD_KML_PATH.exists():
+        return []
+    try:
+        WARD_KML_FEATURES = parse_kml_features(WARD_KML_PATH)
+    except Exception:
+        WARD_KML_FEATURES = []
+    return WARD_KML_FEATURES
+
+def get_outer_rings(geometry):
+    if not geometry:
+        return []
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+    if gtype == "Polygon":
+        return [coords[0]] if coords else []
+    if gtype == "MultiPolygon":
+        rings = []
+        for polygon in coords:
+            if polygon:
+                rings.append(polygon[0])
+        return rings
+    return []
+
+def ring_area(ring):
+    if not ring or len(ring) < 3:
+        return 0.0
+    area = 0.0
+    for idx in range(len(ring) - 1):
+        x1, y1 = ring[idx]
+        x2, y2 = ring[idx + 1]
+        area += (x1 * y2) - (x2 * y1)
+    return area / 2.0
+
+def ring_centroid(ring):
+    if not ring or len(ring) < 3:
+        return None
+    area = ring_area(ring)
+    if abs(area) < 1e-12:
+        lon = sum(point[0] for point in ring) / len(ring)
+        lat = sum(point[1] for point in ring) / len(ring)
+        return (lon, lat)
+
+    cx = 0.0
+    cy = 0.0
+    for idx in range(len(ring) - 1):
+        x1, y1 = ring[idx]
+        x2, y2 = ring[idx + 1]
+        cross = (x1 * y2) - (x2 * y1)
+        cx += (x1 + x2) * cross
+        cy += (y1 + y2) * cross
+    factor = 1.0 / (6.0 * area)
+    return (cx * factor, cy * factor)
+
+def geometry_centroid(geometry):
+    outer_rings = get_outer_rings(geometry)
+    if not outer_rings:
+        return None
+    best_ring = max(outer_rings, key=lambda ring: abs(ring_area(ring)))
+    return ring_centroid(best_ring)
+
+def point_in_ring(point, ring):
+    if not ring or len(ring) < 3:
+        return False
+    x, y = point
+    inside = False
+    for idx in range(len(ring)):
+        x1, y1 = ring[idx]
+        x2, y2 = ring[(idx + 1) % len(ring)]
+        intersects = ((y1 > y) != (y2 > y))
+        if intersects:
+            xin = (x2 - x1) * (y - y1) / ((y2 - y1) + 1e-15) + x1
+            if x < xin:
+                inside = not inside
+    return inside
+
+def geometry_contains_point(point, geometry):
+    if not point or not geometry:
+        return False
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+
+    if gtype == "Polygon":
+        if not coords:
+            return False
+        if not point_in_ring(point, coords[0]):
+            return False
+        for hole in coords[1:]:
+            if point_in_ring(point, hole):
+                return False
+        return True
+
+    if gtype == "MultiPolygon":
+        for polygon in coords:
+            if not polygon:
+                continue
+            if not point_in_ring(point, polygon[0]):
+                continue
+            in_hole = any(point_in_ring(point, hole) for hole in polygon[1:])
+            if not in_hole:
+                return True
+    return False
+
+def distance_sq(point_a, point_b):
+    return (point_a[0] - point_b[0]) ** 2 + (point_a[1] - point_b[1]) ** 2
+
+def build_metric_payload(row):
+    vehicular_pct, industrial_pct, other_pct = normalize_contributions(
+        row.get("vehicular_pct"),
+        row.get("industrial_pct"),
+    )
+    return {
+        "aqi": safe_to_float(row.get("avg_AQI"), 0),
+        "pm2_5": safe_to_float(row.get("pm2_5"), 0),
+        "pm10": safe_to_float(row.get("pm10"), 0),
+        "traffic_raw": safe_to_float(row.get("traffic_raw"), 0),
+        "industrial_count": safe_to_float(row.get("industrial_count"), 0),
+        "distance_km": safe_to_float(row.get("distance_km"), 0),
+        "vehicular_pct": vehicular_pct,
+        "industrial_pct": industrial_pct,
+        "other_pct": other_pct,
+    }
+
+def aggregate_metrics(samples):
+    if not samples:
+        return None
+    metrics = [sample["metrics"] for sample in samples]
+    return {
+        "aqi": float(np.mean([item["aqi"] for item in metrics])),
+        "pm2_5": float(np.mean([item["pm2_5"] for item in metrics])),
+        "pm10": float(np.mean([item["pm10"] for item in metrics])),
+        "traffic_raw": float(np.mean([item["traffic_raw"] for item in metrics])),
+        "industrial_count": float(np.mean([item["industrial_count"] for item in metrics])),
+        "distance_km": float(np.mean([item["distance_km"] for item in metrics])),
+        "vehicular_pct": int(round(np.mean([item["vehicular_pct"] for item in metrics]))),
+        "industrial_pct": int(round(np.mean([item["industrial_pct"] for item in metrics]))),
+        "other_pct": int(round(np.mean([item["other_pct"] for item in metrics]))),
+    }
+
+def build_locality_samples(ward_lookup):
+    samples = []
+    if not WARD_GEOJSON:
+        return samples
+
+    for feature in WARD_GEOJSON.get("features", []):
+        props = feature.get("properties", {})
+        name = props.get("name")
+        if not name:
+            continue
+        row = ward_lookup.get(normalize_ward_name(name))
+        if not row:
+            continue
+        point = geometry_centroid(feature.get("geometry"))
+        if not point:
+            continue
+        samples.append({
+            "name": row.get("name"),
+            "point": point,
+            "metrics": build_metric_payload(row),
+        })
+    return samples
+
+# --------------------------------------------------
+# API ROUTES
+# --------------------------------------------------
 
 @app.get("/api/dashboard")
 async def get_dashboard_data():
-    """Main dashboard data endpoint"""
-    
     try:
-        # Clean data - remove rows with Ward_ prefix and sort by AQI
-        ward_data_clean = WARD_DATA[~WARD_DATA['name'].str.startswith('Ward_', na=False)].copy()
-        ward_data_sorted = ward_data_clean.sort_values('avg_AQI', ascending=False)
-        
-        # 1. GENERATE ALERTS (top 3 worst wards)
+        ward_data_clean = build_ward_dataset()
+        city_hourly = get_city_hourly_snapshot()
+
+        ward_data_sorted = ward_data_clean.sort_values(
+            "avg_AQI", ascending=False
+        )
+
+        # 1. ALERTS (TOP 3)
         alerts = []
         for idx, row in ward_data_sorted.head(3).iterrows():
-            alert_type = 'Emergency' if row['avg_AQI'] >= 300 else 'Forecast Alert' if row['avg_AQI'] >= 200 else 'Hotspot Detected'
+            alert_type = (
+                "Emergency"
+                if row["avg_AQI"] >= 300
+                else "Forecast Alert"
+                if row["avg_AQI"] >= 200
+                else "Hotspot Detected"
+            )
+
             alerts.append({
-                'id': int(idx),
-                'severity': get_alert_severity(row['avg_AQI']),
-                'ward': row['name'],
-                'aqi': int(row['avg_AQI']),
-                'type': alert_type,
-                'time': f"{np.random.randint(1, 60)} min ago"
+                "id": int(idx),
+                "severity": get_alert_severity(row["avg_AQI"]),
+                "ward": row["name"],
+                "aqi": int(row["avg_AQI"]),
+                "type": alert_type,
+                "time": f"{np.random.randint(1, 60)} min ago",
             })
-        
+
         # 2. KPIs
-        city_aqi = ward_data_clean['avg_AQI'].mean()
-        worst_aqi = ward_data_clean['avg_AQI'].max()
-        critical_count = len(ward_data_clean[ward_data_clean['avg_AQI'] >= 200])
-        
-        # Calculate 7-day trend (using timeseries data)
-        aqi_ts = AQI_TIMESERIES.copy()
-        aqi_ts['date_ist'] = pd.to_datetime(aqi_ts['date_ist'], format='%d/%m/%Y')
-        recent_7days = aqi_ts[aqi_ts['date_ist'] >= (aqi_ts['date_ist'].max() - timedelta(days=7))]
-        trend_pct = ((recent_7days['aqi_index'].mean() - aqi_ts['aqi_index'].mean()) / aqi_ts['aqi_index'].mean() * 100)
-        
+        city_aqi = ward_data_clean["avg_AQI"].mean()
+        worst_aqi = ward_data_clean["avg_AQI"].max()
+        critical_count = len(
+            ward_data_clean[ward_data_clean["avg_AQI"] >= 200]
+        )
+
+        aqi_ts = AQI_TIMESERIES.dropna(subset=["date_parsed"]).copy()
+        aqi_ts["date_ist"] = aqi_ts["date_parsed"]
+
+        recent_7days = aqi_ts[
+            aqi_ts["date_ist"]
+            >= (aqi_ts["date_ist"].max() - timedelta(days=7))
+        ]
+
+        trend_pct = (
+            (recent_7days["aqi_index"].mean() - aqi_ts["aqi_index"].mean())
+            / aqi_ts["aqi_index"].mean()
+            * 100
+        )
+
         kpis = {
-            'cityAqi': int(city_aqi),
-            'worstWard': int(worst_aqi),
-            'criticalCount': int(critical_count),
-            'trend': f"{'+' if trend_pct > 0 else ''}{int(trend_pct)}%"
+            "cityAqi": int(city_aqi),
+            "worstWard": int(worst_aqi),
+            "criticalCount": int(critical_count),
+            "trend": f"{'+' if trend_pct > 0 else ''}{int(trend_pct)}%",
         }
-        
-        # 3. TREND DATA (from timeseries)
+
+        # 3. TREND DATA
         def get_daily_avg(days):
-            last_n_days = aqi_ts[aqi_ts['date_ist'] >= (aqi_ts['date_ist'].max() - timedelta(days=days))]
-            daily = last_n_days.groupby('date_ist')['aqi_index'].mean().values
+            last_n_days = aqi_ts[
+                aqi_ts["date_ist"]
+                >= (aqi_ts["date_ist"].max() - timedelta(days=days))
+            ]
+            daily = (
+                last_n_days.groupby("date_ist")["aqi_index"]
+                .mean()
+                .values
+            )
             return [int(x) for x in daily]
-        
+
         trend_data = {
-            '7days': get_daily_avg(7),
-            '30days': get_daily_avg(30),
-            '90days': get_daily_avg(90)
+            "7days": get_daily_avg(7),
+            "30days": get_daily_avg(30),
+            "90days": get_daily_avg(90),
         }
-        
-        # 4. WARD RISK RANKINGS (top 10)
+
+        # 4. WARD RISK RANKINGS
         ward_risks = []
-        for idx, (i, row) in enumerate(ward_data_sorted.head(10).iterrows(), 1):
-            # Determine primary pollutant
-            pollutant = 'PM2.5' if row['pm2_5'] > row['pm10'] else 'PM10'
-            
-            # Determine source
-            if row['vehicular_pct'] > row['industrial_pct']:
-                source = 'Traffic'
-            elif row['industrial_pct'] > 0:
-                source = 'Industrial'
+        for rank, (_, row) in enumerate(
+            ward_data_sorted.head(10).iterrows(), 1
+        ):
+            pollutant = (
+                "PM2.5" if row["pm2_5"] > row["pm10"] else "PM10"
+            )
+
+            if row["vehicular_pct"] > row["industrial_pct"]:
+                source = "Traffic"
+            elif row["industrial_pct"] > 0:
+                source = "Industrial"
             else:
-                source = 'Mixed'
-            
+                source = "Mixed"
+
             ward_risks.append({
-                'rank': idx,
-                'ward': row['name'],
-                'aqi': int(row['avg_AQI']),
-                'pollutant': pollutant,
-                'source': source,
-                'status': get_aqi_status(row['avg_AQI'])
+                "rank": rank,
+                "ward": row["name"],
+                "aqi": int(row["avg_AQI"]),
+                "pollutant": pollutant,
+                "source": source,
+                "status": get_aqi_status(row["avg_AQI"]),
             })
-        
-        # 5. CITY SUMMARY (count wards by category)
+
+        # 5. CITY SUMMARY
         city_summary = {
-            'good': int(len(ward_data_clean[ward_data_clean['avg_AQI'] <= 50])),
-            'moderate': int(len(ward_data_clean[(ward_data_clean['avg_AQI'] > 50) & (ward_data_clean['avg_AQI'] <= 100)])),
-            'unhealthy': int(len(ward_data_clean[(ward_data_clean['avg_AQI'] > 100) & (ward_data_clean['avg_AQI'] <= 200)])),
-            'veryUnhealthy': int(len(ward_data_clean[(ward_data_clean['avg_AQI'] > 200) & (ward_data_clean['avg_AQI'] <= 300)])),
-            'hazardous': int(len(ward_data_clean[ward_data_clean['avg_AQI'] > 300]))
+            "good": int(len(ward_data_clean[ward_data_clean["avg_AQI"] <= 50])),
+            "moderate": int(len(
+                ward_data_clean[
+                    (ward_data_clean["avg_AQI"] > 50)
+                    & (ward_data_clean["avg_AQI"] <= 100)
+                ]
+            )),
+            "unhealthy": int(len(
+                ward_data_clean[
+                    (ward_data_clean["avg_AQI"] > 100)
+                    & (ward_data_clean["avg_AQI"] <= 200)
+                ]
+            )),
+            "veryUnhealthy": int(len(
+                ward_data_clean[
+                    (ward_data_clean["avg_AQI"] > 200)
+                    & (ward_data_clean["avg_AQI"] <= 300)
+                ]
+            )),
+            "hazardous": int(len(ward_data_clean[ward_data_clean["avg_AQI"] > 300])),
         }
-        
+
+        weather_correlation = build_weather_correlation_payload(city_hourly)
+        forecast_payload = build_aqi_forecast_payload(city_hourly)
+
         return {
-            'alerts': alerts,
-            'kpis': kpis,
-            'trendData': trend_data,
-            'wardRisks': ward_risks,
-            'citySummary': city_summary,
-            'lastUpdated': datetime.now().isoformat()
+            "alerts": alerts,
+            "kpis": kpis,
+            "trendData": trend_data,
+            "wardRisks": ward_risks,
+            "citySummary": city_summary,
+            "weatherCorrelation": weather_correlation,
+            "aqiForecast": forecast_payload,
+            "lastUpdated": datetime.now().isoformat(),
         }
-        
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/analytics/weather-correlation")
+async def get_weather_correlation_analytics():
+    try:
+        ward_data_clean = build_ward_dataset()
+        city_hourly = get_city_hourly_snapshot()
+
+        city_payload = build_weather_correlation_payload(city_hourly)
+        station_payloads = build_station_weather_correlation_payloads()
+        ward_insights = build_ward_weather_insights(ward_data_clean, station_payloads)
+
+        return {
+            "city": city_payload,
+            "stations": station_payloads,
+            "wards": ward_insights,
+            "topImpactedWards": ward_insights[:15],
+            "metadata": {
+                "wardCount": len(ward_insights),
+                "stationCount": len(station_payloads),
+                "lastUpdated": datetime.now().isoformat(),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/analytics/predictive-aqi")
+async def get_predictive_aqi_analytics():
+    try:
+        ward_data_clean = build_ward_dataset()
+        city_hourly = get_city_hourly_snapshot()
+
+        city_forecast = build_aqi_forecast_payload(city_hourly)
+        station_forecasts = build_station_forecast_payloads()
+        ward_forecasts = build_ward_forecast_insights(
+            ward_data_clean,
+            station_forecasts,
+            city_forecast,
+        )
+
+        def ward_predicted(entry, horizon_hours):
+            point = get_forecast_point(entry.get("points", []), horizon_hours)
+            if point:
+                return int(point.get("predictedAqi", entry.get("currentAqi", 0)))
+            return int(entry.get("currentAqi", 0))
+
+        top_risk_24 = sorted(
+            ward_forecasts,
+            key=lambda entry: ward_predicted(entry, 24),
+            reverse=True,
+        )[:15]
+        top_risk_72 = sorted(
+            ward_forecasts,
+            key=lambda entry: ward_predicted(entry, 72),
+            reverse=True,
+        )[:15]
+        top_improvers_72 = sorted(
+            ward_forecasts,
+            key=lambda entry: int(entry.get("delta72", 0)),
+        )[:15]
+
+        return {
+            "city": city_forecast,
+            "stations": station_forecasts,
+            "wards": ward_forecasts,
+            "topRisk24h": top_risk_24,
+            "topRisk72h": top_risk_72,
+            "topImprovers72h": top_improvers_72,
+            "metadata": {
+                "wardCount": len(ward_forecasts),
+                "stationCount": len(station_forecasts),
+                "lastUpdated": datetime.now().isoformat(),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/analytics/solutions")
+async def get_policy_solution_analytics():
+    try:
+        ward_data_clean = build_ward_dataset()
+        city_hourly = get_city_hourly_snapshot()
+
+        station_correlations = build_station_weather_correlation_payloads()
+        ward_weather = build_ward_weather_insights(
+            ward_data_clean,
+            station_correlations,
+        )
+
+        city_forecast = build_aqi_forecast_payload(city_hourly)
+        station_forecasts = build_station_forecast_payloads()
+        ward_forecast = build_ward_forecast_insights(
+            ward_data_clean,
+            station_forecasts,
+            city_forecast,
+        )
+
+        recommendation_payload = generate_policy_recommendations(
+            ward_data_clean.to_dict("records"),
+            ward_weather,
+            ward_forecast,
+            cluster_count=4,
+        )
+
+        recommendation_payload["metadata"] = {
+            "wardCount": len(recommendation_payload.get("wardRecommendations", [])),
+            "weatherWards": len(ward_weather),
+            "forecastWards": len(ward_forecast),
+            "lastUpdated": datetime.now().isoformat(),
+        }
+        return recommendation_payload
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/consumer/overview")
+async def get_consumer_overview():
+    try:
+        ward_data_clean = build_ward_dataset()
+        city_hourly = get_city_hourly_snapshot()
+        if ward_data_clean.empty:
+            raise HTTPException(status_code=500, detail="No ward data available")
+
+        ward_sorted = ward_data_clean.sort_values("avg_AQI", ascending=False).reset_index(drop=True)
+        city_aqi = int(round(float(ward_data_clean["avg_AQI"].mean())))
+        critical_wards = int(len(ward_data_clean[ward_data_clean["avg_AQI"] >= 200]))
+
+        alerts = []
+        for idx, row in ward_sorted.head(12).iterrows():
+            ward_name = str(row.get("name", "Unknown Ward"))
+            aqi_value = int(round(safe_to_float(row.get("avg_AQI"), 0.0)))
+            source = get_dominant_source_label(row.get("vehicular_pct"), row.get("industrial_pct"))
+            alerts.append({
+                "id": idx + 1,
+                "ward": ward_name,
+                "aqi": aqi_value,
+                "severity": get_alert_severity(aqi_value),
+                "source": source,
+                "message": f"{ward_name} is in {get_aqi_band_label(aqi_value)} conditions with {source.lower()} pressure.",
+            })
+
+        hotspots = []
+        ward_table = []
+        for _, row in ward_sorted.iterrows():
+            aqi_value = int(round(safe_to_float(row.get("avg_AQI"), 0.0)))
+            pm25 = round(safe_to_float(row.get("pm2_5"), 0.0), 2)
+            pm10 = round(safe_to_float(row.get("pm10"), 0.0), 2)
+            vehicular_pct, industrial_pct, other_pct = normalize_contributions(
+                row.get("vehicular_pct"),
+                row.get("industrial_pct"),
+            )
+            source = get_dominant_source_label(vehicular_pct, industrial_pct)
+            item = {
+                "ward": str(row.get("name", "Unknown")),
+                "aqi": aqi_value,
+                "band": get_aqi_band_label(aqi_value),
+                "pm2_5": pm25,
+                "pm10": pm10,
+                "source": source,
+                "vehicularPct": vehicular_pct,
+                "industrialPct": industrial_pct,
+                "otherPct": other_pct,
+            }
+            ward_table.append(item)
+            if len(hotspots) < 20:
+                hotspots.append(item)
+
+        weather_correlation = build_weather_correlation_payload(city_hourly)
+        forecast_payload = build_aqi_forecast_payload(city_hourly)
+        forecast_24 = get_forecast_point(forecast_payload.get("points", []), 24)
+        delta_24 = int((forecast_24 or {}).get("deltaFromCurrent", 0))
+
+        strongest_factor = None
+        factors = weather_correlation.get("factors", [])
+        if factors:
+            strongest_factor = max(
+                factors,
+                key=lambda item: abs(safe_to_float(item.get("correlation"), 0.0)),
+            )
+
+        advisories = []
+        if city_aqi >= 300:
+            advisories.append("Severe AQI window: avoid prolonged outdoor activity and use high-filtration masks.")
+        elif city_aqi >= 200:
+            advisories.append("Very unhealthy AQI: minimize high-exertion outdoor travel during peak traffic.")
+        elif city_aqi >= 100:
+            advisories.append("Unhealthy AQI: keep commute exposure short and prefer indoor ventilation controls.")
+        else:
+            advisories.append("Current AQI is relatively stable, but monitor ward-level spikes through the day.")
+
+        if delta_24 > 0:
+            advisories.append("Forecast indicates AQI worsening in the next 24 hours. Plan essential travel earlier.")
+        elif delta_24 < 0:
+            advisories.append("Forecast indicates gradual AQI improvement over the next 24 hours.")
+
+        if strongest_factor:
+            factor_label = strongest_factor.get("label", "Weather")
+            factor_corr = strongest_factor.get("correlation", 0)
+            advisories.append(
+                f"{factor_label} currently shows the strongest AQI linkage (correlation {factor_corr})."
+            )
+
+        advisories.append("Set ward alerts to receive immediate updates when AQI crosses severe thresholds.")
+
+        return {
+            "city": {
+                "aqi": city_aqi,
+                "band": get_aqi_band_label(city_aqi),
+                "status": get_aqi_status(city_aqi),
+                "criticalWards": critical_wards,
+                "activeAlerts": len(alerts),
+            },
+            "alerts": alerts[:10],
+            "hotspots": hotspots,
+            "wardTable": ward_table,
+            "weatherCorrelation": weather_correlation,
+            "forecast": forecast_payload,
+            "generalAdvisories": advisories[:5],
+            "pricing": PRICING_PAYLOAD,
+            "metadata": {
+                "wardCount": len(ward_table),
+                "lastUpdated": datetime.now().isoformat(),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/consumer/insights")
+async def get_consumer_insights(profile: ConsumerProfileInput):
+    try:
+        ward_data_clean = build_ward_dataset()
+        city_hourly = get_city_hourly_snapshot()
+        station_snapshot = get_station_snapshot(hours=24)
+
+        city_weather = build_weather_correlation_payload(city_hourly)
+        city_forecast = build_aqi_forecast_payload(city_hourly)
+        station_forecasts = build_station_forecast_payloads()
+        ward_forecasts = build_ward_forecast_insights(
+            ward_data_clean,
+            station_forecasts,
+            city_forecast,
+        )
+
+        profile_payload = (
+            profile.model_dump()
+            if hasattr(profile, "model_dump")
+            else profile.dict()
+        )
+
+        return build_personalized_consumer_insight(
+            profile_payload,
+            ward_data_clean.to_dict("records"),
+            ward_forecasts,
+            station_snapshot.to_dict("records"),
+            city_weather,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/wards")
 async def get_all_wards():
-    """Get complete ward data for map visualization"""
-    ward_data_clean = WARD_DATA[~WARD_DATA['name'].str.startswith('Ward_', na=False)].copy()
-    
+    ward_data_clean = build_ward_dataset()
+
     return {
-        'wards': ward_data_clean.to_dict('records'),
-        'count': len(ward_data_clean)
+        "wards": ward_data_clean.to_dict("records"),
+        "count": len(ward_data_clean),
     }
 
-# Serve React static files
-import os.path
-from fastapi.responses import FileResponse
+@app.get("/api/map/wards")
+async def get_map_wards():
+    kml_features = load_kml_features()
+    if kml_features:
+        target_features = kml_features
+        geometry_source = "kml"
+    elif WARD_GEOJSON:
+        target_features = [
+            feature
+            for feature in WARD_GEOJSON.get("features", [])
+            if feature.get("properties", {}).get("name")
+        ]
+        geometry_source = "geojson"
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail="No geometry file found. Add delhi_wards.kml or delhi_wards.geojson in Backend/data"
+        )
 
-dist_dir = os.path.join(os.path.dirname(__file__), '..', 'dist')
+    ward_data_clean = build_ward_dataset()
 
-# Mount static files if dist folder exists
-if os.path.exists(dist_dir):
-    app.mount("/assets", StaticFiles(directory=os.path.join(dist_dir, "assets")), name="assets")
-    
+    ward_lookup = {}
+    for _, row in ward_data_clean.iterrows():
+        ward_lookup[normalize_ward_name(row["name"])] = row.to_dict()
+
+    locality_samples = build_locality_samples(ward_lookup)
+    sample_name_set = {sample["name"] for sample in locality_samples}
+    unmatched_aqi_rows = sorted([
+        row.get("name")
+        for _, row in ward_data_clean.iterrows()
+        if row.get("name") not in sample_name_set
+    ])
+
+    features = []
+    observed_name_match = 0
+    observed_spatial = 0
+    estimated = 0
+    no_data = 0
+
+    for feature in target_features:
+        props = feature.get("properties", {})
+        geometry = feature.get("geometry")
+        ward_name = props.get("name")
+        if not ward_name or not geometry:
+            continue
+
+        key = normalize_ward_name(ward_name)
+        direct_row = ward_lookup.get(key)
+        data_quality = None
+        source_names = []
+        metrics = None
+
+        if direct_row:
+            metrics = build_metric_payload(direct_row)
+            data_quality = "observed_name_match"
+            source_names = [direct_row.get("name")]
+            observed_name_match += 1
+        else:
+            ward_centroid = geometry_centroid(geometry)
+            contained = []
+            if locality_samples:
+                for sample in locality_samples:
+                    if geometry_contains_point(sample["point"], geometry):
+                        contained.append(sample)
+            if contained:
+                metrics = aggregate_metrics(contained)
+                data_quality = "observed_spatial"
+                source_names = [sample["name"] for sample in contained[:5]]
+                observed_spatial += 1
+            elif ward_centroid and locality_samples:
+                nearest = min(
+                    locality_samples,
+                    key=lambda sample: distance_sq(sample["point"], ward_centroid)
+                )
+                metrics = dict(nearest["metrics"])
+                data_quality = "estimated_nearest"
+                source_names = [nearest["name"]]
+                estimated += 1
+            else:
+                no_data += 1
+                data_quality = "no_data"
+                metrics = {
+                    "aqi": 0.0,
+                    "pm2_5": 0.0,
+                    "pm10": 0.0,
+                    "traffic_raw": 0.0,
+                    "industrial_count": 0.0,
+                    "distance_km": 0.0,
+                    "vehicular_pct": 0,
+                    "industrial_pct": 0,
+                    "other_pct": 100,
+                }
+
+        features.append({
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": {
+                "name": ward_name,
+                "ward_no": props.get("ward_no"),
+                "ac_name": props.get("ac_name"),
+                "nw2022": props.get("nw2022"),
+                "aqi": int(round(metrics["aqi"])),
+                "pm2_5": float(metrics["pm2_5"]),
+                "pm10": float(metrics["pm10"]),
+                "traffic_raw": float(metrics["traffic_raw"]),
+                "industrial_count": int(round(metrics["industrial_count"])),
+                "vehicular_pct": int(metrics["vehicular_pct"]),
+                "industrial_pct": int(metrics["industrial_pct"]),
+                "other_pct": int(metrics["other_pct"]),
+                "distance_km": float(metrics["distance_km"]),
+                "data_quality": data_quality,
+                "source_localities": source_names,
+                "source_count": len(source_names),
+            },
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "metadata": {
+            "geometrySource": geometry_source,
+            "wardFeatures": len(features),
+            "aqiRows": len(ward_lookup),
+            "localitySamples": len(locality_samples),
+            "observedNameMatchWards": observed_name_match,
+            "observedSpatialWards": observed_spatial,
+            "estimatedWards": estimated,
+            "noDataWards": no_data,
+            "unmatchedAqiRows": unmatched_aqi_rows,
+            "lastUpdated": datetime.now().isoformat(),
+        },
+    }
+
+# --------------------------------------------------
+# STATIC FRONTEND (OPTIONAL)
+# --------------------------------------------------
+
+if DIST_DIR.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=DIST_DIR / "assets"),
+        name="assets",
+    )
+
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):
-        # Serve index.html for all non-API routes (client-side routing)
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not Found")
-        
-        file_path = os.path.join(dist_dir, full_path)
-        
-        # If it's a file that exists, serve it
-        if os.path.isfile(file_path):
+
+        file_path = DIST_DIR / full_path
+
+        if file_path.is_file():
             return FileResponse(file_path)
-        
-        # Otherwise serve index.html for client-side routing
-        return FileResponse(os.path.join(dist_dir, "index.html"))
+
+        return FileResponse(DIST_DIR / "index.html")
+
+# --------------------------------------------------
+# LOCAL RUN SUPPORT
+# --------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-

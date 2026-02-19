@@ -1,220 +1,272 @@
-# Delhi Pollution Dashboard: Ward-Level Air Quality Monitoring
+# Delhi Ward Pollution Monitor (DWLP)
 
-> Real-time AQI analysis and geospatial visualization across 272 Delhi administrative wards
+Dual-portal Delhi air pollution intelligence platform with one shared engine:
 
-[![Made with React](https://img.shields.io/badge/Made%20with-React-61DAFB?style=flat-square&logo=react)](https://reactjs.org/)
-[![Vite](https://img.shields.io/badge/Built%20with-Vite-646CFF?style=flat-square&logo=vite)](https://vitejs.dev/)
-[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
-[![Python](https://img.shields.io/badge/Language-Python-3776AB?style=flat-square&logo=python)](https://www.python.org/)
-[![GeoPandas](https://img.shields.io/badge/Geospatial-GeoPandas-FF6B6B?style=flat-square&logo=pandas)](https://geopandas.org/)
-[![Render](https://img.shields.io/badge/Deployed%20on-Render-46E3B7?style=flat-square&logo=render)](https://render.com/)
+- Government command suite for ward operations and policy support
+- Consumer app for personalized health and commute guidance
 
-## ▸ Overview
+## What this project does
 
-Delhi Pollution Dashboard transforms scattered air quality data into actionable intelligence. Combining 52,560+ hourly AQI readings with 272 ward geospatial boundaries, it provides residents, policymakers, and researchers with real-time pollution insights broken down by source attribution (vehicular, industrial, background).
+- Tracks ward-level AQI and pollutant metrics across Delhi.
+- Renders real ward boundaries on an interactive map (KML/GeoJSON).
+- Provides weather impact correlation and 24-72 hour AQI forecasting.
+- Generates ML-driven government action recommendations in a dedicated solutions engine.
+- Generates profile-based consumer risk scoring and low-pollution route suggestions.
 
-### ▸ Problem
-- Air quality data across Delhi is fragmented across multiple sources
-- Residents can't easily find ward-level pollution information
-- Policymakers lack clear data on pollution source attribution
-- No unified platform exists for real-time air quality monitoring
+## Current pages
 
-## ▸ Key Features
+- `/` Product portal selector (Government vs Consumer)
+- `/government` Government product landing
+- `/dashboard` Command dashboard (home-style theme, streamlined view)
+- `/wards` All wards in compact list/table view
+- `/wards/:wardName` Ward detail view
+- `/map` Real ward polygon map
+- `/weather-correlation` Weather impact analytics
+- `/predictive-aqi` Forecast analytics (24/48/72h)
+- `/solutions` Policy solutions engine
+- `/consumer` Consumer dashboard (public + personalized modules)
+- `/consumer/onboarding` Consumer profile setup
 
-- **Real-Time Dashboard** – Live KPIs, 7-day trends, critical alerts, and PM2.5/PM10 levels
-- **Ward-Level Analytics** – 272 interactive ward cards with searchable AQI data
-- **Pollution Source Breakdown** – 60% vehicular, 25% industrial, 15% background attribution
-- **Geospatial Analysis** – Ward boundary mapping with hotspot identification
-- **Beautiful UI** – Dark theme with smooth animations and responsive design
-- **Fast Performance** – Optimized rendering for 135+ wards grid
-- **Global Accessibility** – Deployed on Render for worldwide access
+## Tech stack
 
-## ▸ Tech Stack
+- Frontend: React 19, Vite 7, React Router 7, anime.js
+- Backend: FastAPI, Uvicorn, Pandas, NumPy
+- Geospatial: custom KML/GeoJSON parsing and spatial matching
+- Data: CSV files under `Backend/data`
 
-| Layer | Technology |
-|-------|------------|
-| Frontend | React 19, Vite 7, TypeScript, React Router, Anime.js |
-| Styling | CSS3, CSS Variables, Responsive Design |
-| Backend | FastAPI 0.128, Python 3.13, Uvicorn |
-| Data Processing | Pandas 2.3, GeoPandas 1.1, NumPy, Shapely 2.1 |
-| Data Sources | CSV (52,560 AQI readings), GeoJSON (272 ward boundaries) |
-| Deployment | Render (Free tier with auto-rebuild) |
-| Storage | Backend CSV files, in-memory processing |
-| Icons & UI | SVG, Custom CSS Grid, Radix primitives |
+## Project structure
 
-## ▸ Prerequisites
-- Node.js 16+ (for frontend)
-- Python 3.10+ (for backend)
-- npm (frontend package manager)
-- pip (Python package manager)
-- Render account (for deployment)
-
-## ▸ Environment Setup
-
-### Frontend (.env or vite.config.js)
-```javascript
-// No secrets needed - uses relative API calls
-// In development: http://localhost:8000
-// In production: Uses same domain (Render handles this)
+```text
+DWLP/
+  src/
+    pages/
+      Home/
+      PortalSelect/
+      Dashboard/
+      MapView/
+      WardDetails/
+      WeatherCorrelation/
+      PredictiveAQI/
+      Solutions/
+      ConsumerDashboard/
+      ConsumerOnboarding/
+  Backend/
+    main.py
+    policy_model.py
+    consumer_model.py
+    requirements.txt
+    data/
+      aqi.csv
+      ward_level_aqi_complete.csv
+      delhi_wards.kml
+      delhi_wards.geojson
+      Final Dataset.csv
+      final_dataset_complete.csv
 ```
 
-### Backend (Backend/requirements.txt)
-```
-fastapi==0.128.0
-uvicorn==0.30.0
-pandas==2.3.3
-geopandas==1.1.2
-shapely==2.1.2
-numpy==2.0.0
-python-multipart==0.0.6
-```
+## Data and analytics flow
 
-## ▸ Installation & Run
+1. `Backend/data/aqi.csv` is the primary AQI + weather time-series source.
+2. `Backend/main.py` builds station and city hourly snapshots.
+3. `ward_level_aqi_complete.csv` is enriched with AQI/pollutant metrics for ward outputs.
+4. Weather correlation and forecast analytics are computed per city/station/ward.
+5. `Backend/policy_model.py` consumes:
+   - ward AQI/source profile
+   - weather impact outputs
+   - predictive outputs  
+   and returns ward-wise intervention recommendations.
+6. `Backend/consumer_model.py` consumes:
+   - ward AQI + PM levels
+   - weather correlation outputs
+   - 24/48/72h forecast points
+   - user family/travel profile
+   and returns personalized risk, advisories, and cleaner route suggestions.
 
-### Local Development
+## API endpoints
+
+### `GET /api/dashboard`
+
+Returns core dashboard payload:
+
+- `alerts`
+- `kpis`
+- `trendData`
+- `wardRisks`
+- `citySummary`
+- `weatherCorrelation` (city-level summary)
+- `aqiForecast` (city-level 24/48/72h summary)
+
+### `GET /api/wards`
+
+Returns:
+
+- `wards`: enriched ward/locality rows
+- `count`
+
+### `GET /api/map/wards`
+
+Returns GeoJSON `FeatureCollection`:
+
+- ward geometry + pollution properties
+- `metadata` with matching quality:
+  - `observedNameMatchWards`
+  - `observedSpatialWards`
+  - `estimatedWards`
+  - `noDataWards`
+  - `unmatchedAqiRows`
+
+### `GET /api/analytics/weather-correlation`
+
+Returns:
+
+- `city`
+- `stations`
+- `wards`
+- `topImpactedWards`
+- `metadata`
+
+### `GET /api/analytics/predictive-aqi`
+
+Returns:
+
+- `city`
+- `stations`
+- `wards`
+- `topRisk24h`
+- `topRisk72h`
+- `topImprovers72h`
+- `metadata`
+
+### `GET /api/analytics/solutions`
+
+Returns ML recommendation output from `Backend/policy_model.py`:
+
+- `model` (type, clusters, training rows, features, centroids)
+- `cityPlaybookSummary`
+- `clusterProfiles`
+- `topImmediateActions`
+- `wardRecommendations`
+- `metadata`
+
+### `GET /api/consumer/overview`
+
+Returns consumer app baseline payload:
+
+- `city` (AQI, band, status, active alerts)
+- `alerts`
+- `hotspots`
+- `wardTable`
+- `weatherCorrelation`
+- `forecast`
+- `generalAdvisories`
+- `pricing`
+- `metadata`
+
+### `POST /api/consumer/insights`
+
+Input profile:
+
+- `ward`
+- `family_members`
+- `elderly`
+- `children`
+- `respiratory_issues`
+- `daily_travel_minutes`
+- `premium`
+
+Returns personalized payload from `Backend/consumer_model.py`:
+
+- `profile` (matched ward + household profile)
+- `wardSnapshot`
+- `forecast` (24/48/72h points)
+- `risk` (score/level/drivers)
+- `healthAdvisories`
+- `routeSuggestions`
+- `recommendations`
+- `pricing`
+
+## Policy model (separate module)
+
+`Backend/policy_model.py` contains the solution model and is intentionally separate from `main.py`.
+
+- Model style: K-means policy segmentation + rule-based playbook mapping.
+- Inputs: AQI severity, +24/+72 forecast deltas, vehicular vs industrial pressure, weather driver/correlation, impact index.
+- Outputs: ward priority score, urgency class, playbook, and 3-4 recommended actions.
+
+## Consumer model (separate module)
+
+`Backend/consumer_model.py` contains user-facing risk intelligence and is intentionally separate from `main.py`.
+
+- Model style: interpretable weighted logistic-style risk scoring + rule-based advisories.
+- Inputs: ward AQI/PM, forecast delta, weather linkage, profile vulnerability, travel load.
+- Outputs: personalized risk level, action recommendations, and low-exposure route options.
+
+## Local setup
+
+## Prerequisites
+
+- Node.js 18+
+- Python 3.10+
+
+## 1) Install dependencies
+
+From project root:
+
 ```bash
-# Install frontend dependencies
 npm install
+pip install -r Backend/requirements.txt
+```
 
-# Install backend dependencies
-cd Backend
-pip install -r requirements.txt
-cd ..
+## 2) Run backend
 
-# Start backend (from root)
-python -m uvicorn Backend.main:app --reload
+```bash
+python -m uvicorn Backend.main:app --reload --host 0.0.0.0 --port 8000
+```
 
-# In another terminal, start frontend
+Backend URL: `http://localhost:8000`
+
+## 3) Run frontend
+
+In another terminal:
+
+```bash
 npm run dev
 ```
 
-**Frontend:** http://localhost:5173
-**Backend:** http://localhost:8000
+Frontend URL: `http://localhost:5173`
 
-### Production Build
+Frontend uses:
+
+- `http://localhost:8000` in dev mode
+- relative API paths in production mode
+
+## Production build notes
+
 ```bash
-# Build React frontend
 npm run build
+```
 
-# Backend auto-serves dist/ folder on production
+Vite outputs to root `dist/`.  
+FastAPI serves static assets if `Backend/dist` exists.
+
+If serving frontend through FastAPI:
+
+```bash
+cp -r dist Backend/dist
 python -m uvicorn Backend.main:app --host 0.0.0.0 --port 8000
 ```
 
-## ▸ Deployment
+## Known limitations
 
-**Live Deployment:** https://delhi-pollution.onrender.com
+- Dashboard ward names and map ward names are sourced from different naming systems in current datasets.
+- Many map wards are spatially assigned or nearest-estimated, not direct name-matched.
+- Use `/api/map/wards -> metadata` to inspect matching quality.
 
-## ▸ Project Demo Video
+## Deployment
 
-**Watch the Full Walkthrough:** https://youtu.be/QS2J_HTg_Lc
+`render.yaml` uses:
 
-## ▸ Usage
+- build: `npm install && npm run build`
+- start: `python -m uvicorn Backend.main:app --host 0.0.0.0 --port $PORT`
 
-### For Users
-1. Visit https://delhi-pollution.onrender.com
-2. **Home Page** → View key air quality statistics
-3. **Dashboard** → See live KPIs, trends, pollution source breakdown
-4. **All Wards** → Search 272 wards, find your neighborhood's AQI
-5. Check PM2.5, PM10, and pollution sources in real-time
-
-### For Developers
-```javascript
-// API Endpoints
-
-GET /api/dashboard
-// Returns: {
-//   "current_aqi": 289,
-//   "critical_alerts": 5,
-//   "avg_pm2_5": 156.3,
-//   "trend": [...],
-//   "alerts": [...]
-// }
-
-GET /api/wards
-// Returns: {
-//   "wards": [
-//     {
-//       "name": "Ward Name",
-//       "avg_AQI": 250,
-//       "pm2_5": 120.5,
-//       "pm10": 280.3,
-//       "vehicular_pct": 60,
-//       "industrial_pct": 25,
-//       ...
-//     }
-//   ],
-//   "count": 135
-// }
-```
-
-## ▸ Data Pipeline
-
-```
-Raw CSV Data (52,560 readings)
-    ↓
-Pandas Processing (hourly → ward-level)
-    ↓
-GeoPandas Geospatial Analysis (boundary matching)
-    ↓
-Pollution Source Attribution (traffic, industry, background)
-    ↓
-FastAPI Endpoints (/api/dashboard, /api/wards)
-    ↓
-React Frontend (real-time visualization)
-```
-
-## ▸ Project Structure
-```
-Delhi-Pollution/
-├─ src/
-│  ├─ pages/
-│  │  ├─ Dashboard/
-│  │  ├─ Home/
-│  │  └─ WardDetails/
-│  ├─ App.jsx
-│  ├─ main.jsx
-│  └─ assets/
-├─ Backend/
-│  ├─ main.py (FastAPI app)
-│  ├─ data_pipeline.py
-│  ├─ data/
-│  │  ├─ aqi.csv (52,560 readings)
-│  │  ├─ delhi_wards.geojson (272 boundaries)
-│  │  └─ ward_level_aqi_complete.csv
-│  └─ requirements.txt
-├─ public/
-│  └─ favicon.svg
-├─ package.json
-├─ vite.config.js
-├─ index.html
-└─ README.md
-```
-
-## ▸ Key Achievements
-- ✅ Real-time AQI monitoring across 272 Delhi wards
-- ✅ Complex geospatial analysis with 52,560+ data points
-- ✅ Pollution source attribution (vehicular, industrial, background)
-- ✅ Fully responsive dashboard with smooth animations
-- ✅ Global deployment on Render (working on all devices)
-- ✅ End-to-end data pipeline (collection → processing → visualization)
-- ✅ API-driven architecture for scalability
-
-## ▸ Contributing
-We welcome contributions! Please:
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## ▸ Acknowledgments
-- **Data Sources:** Delhi pollution monitoring stations, GeoJSON ward boundaries
-- **Technologies:** React, FastAPI, GeoPandas, Render
-- **Inspiration:** Global air quality initiatives and public health advocates
-- **Community:** All contributors and users supporting better air quality data
-
-<div align="center">
-  <strong>Delhi Pollution Dashboard</strong><br>
-  Making air quality data transparent and actionable<br>
-  Made with ❤️ by Sudo cure
-</div>
+If deploying single-service frontend+backend, ensure frontend assets are available in `Backend/dist`.
