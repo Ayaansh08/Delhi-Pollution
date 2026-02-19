@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import anime from 'animejs/lib/anime.es.js';
 import './Solutions.css';
 
-const API_BASE = import.meta.env.DEV ? 'http://localhost:8000' : '';
+const API_BASE = import.meta.env.DEV ? 'https://delhi-pollution-2.onrender.com' : '';
 
 const formatDateTime = (isoValue) => {
   if (!isoValue) return '-';

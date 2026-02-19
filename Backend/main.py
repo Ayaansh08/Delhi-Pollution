@@ -1590,8 +1590,43 @@ if DIST_DIR.exists():
 # --------------------------------------------------
 # LOCAL RUN SUPPORT
 # --------------------------------------------------
-
 if __name__ == "__main__":
+    import os
     import uvicorn
+    
+    # Use Render.com production URL as primary, fallback to local
     port = int(os.getenv("PORT", 8000))
+    
+    # Add CORS middleware for frontend compatibility
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi import FastAPI
+    
+    # Add this proxy endpoint to forward to Render.com API
+    @app.get("/api/consumer/overview")
+    async def proxy_overview():
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://delhi-pollution-2.onrender.com/api/consumer/overview") as resp:
+                return await resp.json()
+    
+    @app.post("/api/consumer/insights")
+    async def proxy_insights(request: dict):
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://delhi-pollution-2.onrender.com/api/consumer/insights", 
+                                   json=request) as resp:
+                return await resp.json()
+    
+    # Add CORS for your React frontend
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Or specify your frontend URL
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    print(f"🚀 Starting server on port {port}")
+    print(f"📡 Proxying to https://delhi-pollution-2.onrender.com")
+    
     uvicorn.run(app, host="0.0.0.0", port=port)
